@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Temu Invoice Printer (Orders → Iframes → PDF)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { --gap: 14px; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 16px; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .note { font-size: 13px; color: #444; margin-bottom: 10px; }
+  .bar { display: flex; gap: var(--gap); flex-wrap: wrap; align-items: center; margin: 10px 0; }
+  .btn { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+  .btn.primary { background: #0a84ff; color: white; border-color: #0a5fe6; }
+  .btn.warn { background: #ffd6a5; }
+  #status { font-size: 13px; color: #333; }
+  .iframes { margin-top: 16px; display: flex; flex-direction: column; gap: var(--gap); }
+  .frame-wrapper { border: 1px solid #ddd; padding: 8px; border-radius: 8px; }
+  .frame-meta { font-size: 12px; color: #333; display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:6px;}
+  iframe { width: 100%; height: 900px; border: 1px solid #999; border-radius: 6px; }
+  code { background: #f1f1f1; padding: 2px 4px; border-radius: 4px; }
+  @media print {
+    .no-print { display: none !important; }
+    .frame-wrapper { page-break-after: always; border: none; padding: 0; margin: 0; }
+    iframe { height: 100vh; width: 100vw; border: none; border-radius: 0; }
+    body { margin: 0; }
+  }
+</style>
+</head>
+<body>
+  <h1>Temu Invoice Printer</h1>
+  <div class="note">
+    Upload your <strong>Purchases.xlsx</strong> (or CSV). The tool finds <code>Order ID</code> or extracts it from the <code>url</code> column, creates one
+    invoice iframe per order using <code>parent_order_sn</code>, then you can “Print to PDF”. If iframes are blocked, use “Open all in tabs”.
+  </div>
+
+  <div class="bar no-print">
+    <input type="file" id="file" accept=".xlsx,.xls,.csv" />
+    <button id="generate" class="btn primary">Generate iframes</button>
+    <button id="openTabs" class="btn">Open all in tabs (fallback)</button>
+    <button id="printAll" class="btn">Print all</button>
+    <button id="clear" class="btn warn">Clear</button>
+    <span id="status"></span>
+  </div>
+
+  <div class="note">
+    URL template: <code>https://www.temu.com/bgt_order_detail.html?parent_order_sn={ORDER_ID}&page_from=1</code>
+  </div>
+
+  <div id="iframes" class="iframes"></div>
+
+<script>
+/* XLSX parsing (no network): */
+const XLSX_READY = (function(){
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+  document.head.appendChild(s);
+  return new Promise(resolve => { s.onload = resolve; });
+})();
+
+const $ = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+
+const fileInput = $('#file');
+const generateBtn = $('#generate');
+const openTabsBtn = $('#openTabs');
+const printBtn = $('#printAll');
+const clearBtn = $('#clear');
+const statusEl = $('#status');
+const framesDiv = $('#iframes');
+
+const BASE = 'https://www.temu.com/bgt_order_detail.html?parent_order_sn={ID}&page_from=1';
+
+function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+function extractParam(url, key) {
+  try {
+    const u = new URL(url);
+    return u.searchParams.get(key);
+  } catch { return null; }
+}
+function cleanID(id) {
+  if (!id) return null;
+  let s = String(id).trim();
+  if (!s) return null;
+  // Handle cells that already contain full URLs:
+  if (/^https?:\/\//i.test(s)) {
+    const fromUrl = extractParam(s, 'parent_order_sn');
+    if (fromUrl) return fromUrl.trim();
+  }
+  // Strip quotes/whitespace
+  s = s.replace(/^["']|["']$/g, '').trim();
+  // Basic sanity check (PO-###-... pattern)
+  if (!/^PO-\d{3}-/.test(s)) return s; // allow other formats just in case
+  return s;
+}
+
+function getOrderIDsFromSheet(ws) {
+  // Find header row
+  const data = XLSX.utils.sheet_to_json(ws, { defval: null, raw: false });
+  if (!data.length) return [];
+
+  // Possible header variants
+  const idKeys = ['Order ID','OrderID','order id','order_id','Order_Id','ORDER ID','ORDER_ID'];
+  const urlKeys = ['url','URL','Url','link','Link'];
+
+  // Pick the first matching key in the first row
+  const keys = Object.keys(data[0]);
+  const orderKey = keys.find(k => idKeys.includes(k));
+  const urlKey = keys.find(k => urlKeys.includes(k));
+
+  let ids = [];
+
+  if (orderKey) {
+    ids = data.map(row => cleanID(row[orderKey])).filter(Boolean);
+  } else if (urlKey) {
+    ids = data.map(row => cleanID(row[urlKey])).filter(Boolean);
+  } else {
+    // Try to scan all fields for something that looks like an order id or parent_order_sn in a url
+    ids = data.flatMap(row => {
+      return Object.values(row).map(v => cleanID(v)).filter(Boolean);
+    });
+  }
+
+  // De-dupe and drop empties
+  const uniq = Array.from(new Set(ids.filter(Boolean)));
+  return uniq;
+}
+
+async function parseFile(file) {
+  const name = (file && file.name || '').toLowerCase();
+  const buf = await file.arrayBuffer();
+
+  if (name.endsWith('.csv')) {
+    // Lightweight CSV parser
+    const text = new TextDecoder().decode(buf);
+    // Split into rows, split by commas (simple — assumes no quoted commas)
+    const rows = text.split(/\r?\n/).map(r => r.split(','));
+    // Locate candidate columns
+    const header = rows[0] || [];
+    const idIdx = header.findIndex(h => /^(order\s*id|orderid|order_id)$/i.test(h.trim()));
+    const urlIdx = header.findIndex(h => /^(url|link)$/i.test(h.trim()));
+    let ids = [];
+    for (let i=1;i<rows.length;i++){
+      const row = rows[i];
+      const raw = idIdx >= 0 ? row[idIdx] : (urlIdx >= 0 ? row[urlIdx] : null);
+      const cid = cleanID(raw);
+      if (cid) ids.push(cid);
+    }
+    return Array.from(new Set(ids));
+  } else {
+    await XLSX_READY;
+    const wb = XLSX.read(buf, { type: 'array' });
+    // Prefer the first sheet (your file uses Sheet0)
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    return getOrderIDsFromSheet(ws);
+  }
+}
+
+function makeFrame(orderId, idx) {
+  const url = BASE.replace('{ID}', encodeURIComponent(orderId));
+  const wrap = document.createElement('div');
+  wrap.className = 'frame-wrapper';
+  const meta = document.createElement('div');
+  meta.className = 'frame-meta';
+  meta.innerHTML = `<div><strong>${idx+1}.</strong> Order ID: <code>${orderId}</code></div>
+                    <div><a target="_blank" rel="noopener" href="${url}">open ↗</a></div>`;
+  const iframe = document.createElement('iframe');
+  iframe.loading = 'lazy';
+  iframe.referrerPolicy = 'no-referrer-when-downgrade';
+  iframe.src = url;
+  wrap.appendChild(meta);
+  wrap.appendChild(iframe);
+  return wrap;
+}
+
+let lastIDs = [];
+
+generateBtn.addEventListener('click', async () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) { alert('Choose your Purchases.xlsx (or CSV) first.'); return; }
+  setStatus('Parsing file…');
+  try {
+    const ids = await parseFile(file);
+    if (!ids.length) { setStatus('No order IDs found.'); return; }
+    lastIDs = ids;
+    framesDiv.innerHTML = '';
+    setStatus(`Found ${ids.length} order IDs. Building iframes…`);
+    // Build frames
+    ids.forEach((id, i) => {
+      framesDiv.appendChild(makeFrame(id, i));
+    });
+    setStatus(`Done. Rendered ${ids.length} iframes.`);
+  } catch (e) {
+    console.error(e);
+    setStatus('Error parsing file. See console for details.');
+  }
+});
+
+openTabsBtn.addEventListener('click', () => {
+  if (!lastIDs.length) { alert('Generate first so we have the order IDs.'); return; }
+  const opened = [];
+  lastIDs.forEach(id => {
+    const url = BASE.replace('{ID}', encodeURIComponent(id));
+    const w = window.open(url, '_blank', 'noopener');
+    if (w) opened.push(url);
+  });
+  setStatus(`Opened ${opened.length} tabs.`);
+});
+
+printBtn.addEventListener('click', () => {
+  window.print();
+});
+
+clearBtn.addEventListener('click', () => {
+  framesDiv.innerHTML = '';
+  lastIDs = [];
+  fileInput.value = '';
+  setStatus('');
+});
+</script>
+</body>
+</html>
