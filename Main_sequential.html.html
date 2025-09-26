@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Temu Invoice Loader (Sequential)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { --gap:14px; --accent:#0a84ff; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:16px; }
+  h1 { margin: 0 0 6px; font-size:20px; }
+  .note { font-size:13px; color:#444; margin-bottom:10px; }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+  .btn { padding:8px 12px; border-radius:6px; border:1px solid #ccc; background:#f7f7f7; cursor:pointer; }
+  .btn.primary { background:var(--accent); color:#fff; border-color:#0a5fe6; }
+  .btn.warn { background:#ffd6a5; }
+  .btn.ghost { background:#fff; }
+  #status { font-size:13px; color:#333; }
+  .grid { display:flex; flex-direction:column; gap:var(--gap); margin-top:12px; }
+  .item { border:1px solid #ddd; border-radius:8px; padding:8px; }
+  .meta { font-size:12px; color:#333; display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:6px; }
+  iframe { width:100%; height:900px; border:1px solid #999; border-radius:6px; }
+  code { background:#f1f1f1; padding:2px 4px; border-radius:4px; }
+  .overlay { position: fixed; inset: 0; background: rgba(255,255,255,0.9); display: none; align-items:center; justify-content:center; flex-direction:column; gap:12px; z-index: 9999; }
+  .overlay.show { display:flex; }
+  .progress { width: min(520px, 90vw); height: 10px; background:#eee; border-radius:999px; overflow:hidden; border:1px solid #ddd; }
+  .barInner { height:100%; width:0%; background: var(--accent); transition: width .2s; }
+  .pill { font-size:11px; padding:2px 6px; border-radius:999px; border:1px solid #ccc; }
+  .ok { background:#e7f7ee; border-color:#98e4b7; }
+  .err { background:#fde2e2; border-color:#f5a3a3; }
+  .pending { background:#f1f1f1; }
+  @media print {
+    .no-print { display:none !important; }
+    .item { page-break-after: always; border: none; padding: 0; margin: 0; }
+    iframe { height: 100vh; width: 100vw; border: none; border-radius: 0; }
+    body { margin: 0; }
+  }
+</style>
+</head>
+<body>
+  <h1>Temu Invoice Loader</h1>
+  <div class="note">
+    Upload your <strong>Purchases.xlsx</strong> or CSV. This parses all order IDs and loads invoices <em>sequentially</em> to avoid crashes.
+    URL template: <code>https://www.temu.com/bgt_order_detail.html?parent_order_sn={ORDER_ID}&page_from=1</code>
+  </div>
+
+  <div class="bar no-print">
+    <input id="file" type="file" accept=".xlsx,.xls,.csv" />
+    <select id="concurrency" title="How many iframes load in parallel">
+      <option value="1" selected>Load 1 at a time (safe)</option>
+      <option value="2">Load 2 at a time</option>
+      <option value="3">Load 3 at a time</option>
+    </select>
+    <button id="start" class="btn primary">Start</button>
+    <button id="pause" class="btn">Pause</button>
+    <button id="resume" class="btn">Resume</button>
+    <button id="cancel" class="btn warn">Cancel</button>
+    <button id="print" class="btn ghost">Print loaded</button>
+    <button id="openTabs" class="btn ghost">Open all in tabs (fallback)</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="list" class="grid"></div>
+
+  <div id="overlay" class="overlay">
+    <div style="font-weight:600;">Loading invoices… <span id="ovText"></span></div>
+    <div class="progress"><div id="ovBar" class="barInner"></div></div>
+    <div style="font-size:12px;color:#666;">Pause/Resume anytime. Printing works best after the pages you need are loaded.</div>
+  </div>
+
+<script>
+// Load SheetJS
+const XLSX_READY = (function(){
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+  document.head.appendChild(s);
+  return new Promise(r => s.onload = r);
+})();
+
+const $ = sel => document.querySelector(sel);
+const fileInput = $('#file');
+const startBtn = $('#start');
+const pauseBtn = $('#pause');
+const resumeBtn = $('#resume');
+const cancelBtn = $('#cancel');
+const printBtn = $('#print');
+const openTabsBtn = $('#openTabs');
+const listDiv = $('#list');
+const overlay = $('#overlay');
+const ovText = $('#ovText');
+const ovBar = $('#ovBar');
+const concSel = $('#concurrency');
+const statusEl = $('#status');
+
+const BASE = 'https://www.temu.com/bgt_order_detail.html?parent_order_sn={ID}&page_from=1';
+
+let IDS = [];
+let queue = [];
+let running = 0;
+let paused = false;
+let cancelled = false;
+let doneCount = 0;
+let total = 0;
+
+function setStatus(msg){ statusEl.textContent = msg || ''; }
+function setOverlay(pct, label){
+  ovBar.style.width = (pct*100).toFixed(1) + '%';
+  ovText.textContent = label || '';
+}
+
+function extractParam(url, key) {
+  try { return new URL(url).searchParams.get(key); } catch { return null; }
+}
+function cleanID(v){
+  if (v == null) return null;
+  let s = String(v).trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) {
+    const id = extractParam(s, 'parent_order_sn');
+    if (id) return id.trim();
+  }
+  s = s.replace(/^["']|["']$/g,'').trim();
+  return s;
+}
+
+async function parseFile(file){
+  const name = (file?.name||'').toLowerCase();
+  const buf = await file.arrayBuffer();
+  await XLSX_READY;
+  if (name.endsWith('.csv')){
+    // Use SheetJS CSV parsing for robustness
+    const wb = XLSX.read(buf, {type:'array'});
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, {defval:null});
+    return extractIDsFromRows(rows);
+  } else {
+    const wb = XLSX.read(buf, {type:'array'});
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, {defval:null});
+    return extractIDsFromRows(rows);
+  }
+}
+
+function extractIDsFromRows(rows){
+  if (!rows.length) return [];
+  const keys = Object.keys(rows[0]);
+  const idKeys = ['Order ID','OrderID','order id','order_id','Order_Id','ORDER ID','ORDER_ID'];
+  const urlKeys = ['url','URL','Url','link','Link'];
+  const orderKey = keys.find(k => idKeys.includes(k));
+  const urlKey = keys.find(k => urlKeys.includes(k));
+  let ids = [];
+  if (orderKey) ids = rows.map(r => cleanID(r[orderKey])).filter(Boolean);
+  else if (urlKey) ids = rows.map(r => cleanID(r[urlKey])).filter(Boolean);
+  else {
+    ids = rows.flatMap(r => Object.values(r).map(cleanID)).filter(Boolean);
+  }
+  // de-dup while preserving order
+  const seen = new Set();
+  const uniq = [];
+  for (const id of ids){ if (!seen.has(id)){ seen.add(id); uniq.push(id); } }
+  return uniq;
+}
+
+function makeItem(orderId, idx){
+  const wrap = document.createElement('div');
+  wrap.className = 'item';
+  wrap.dataset.id = orderId;
+  wrap.innerHTML = `<div class="meta">
+      <div><strong>${idx+1}.</strong> <span class="pill pending">${orderId}</span></div>
+      <div><a target="_blank" rel="noopener" href="${BASE.replace('{ID}', encodeURIComponent(orderId))}">open ↗</a></div>
+    </div>`;
+  const frame = document.createElement('iframe');
+  frame.loading = 'lazy';
+  wrap.appendChild(frame);
+  return {wrap, frame};
+}
+
+function loadOne(orderId, container){
+  return new Promise(resolve => {
+    const url = BASE.replace('{ID}', encodeURIComponent(orderId));
+    const frame = container.querySelector('iframe');
+    const pill = container.querySelector('.pill');
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      pill.classList.remove('pending'); pill.classList.add(ok ? 'ok' : 'err');
+      container.dataset.status = ok ? 'ok' : 'err';
+      resolve(ok);
+    };
+    frame.addEventListener('load', () => finish(true), {once:true});
+    frame.addEventListener('error', () => finish(false), {once:true});
+    // Fallback timeout (30s) in case neither event fires
+    setTimeout(() => finish(true), 30000);
+    frame.src = url;
+  });
+}
+
+async function runner(){
+  const max = Number(concSel.value || '1');
+  while (queue.length && !cancelled){
+    if (paused || running >= max){ await new Promise(r => setTimeout(r, 150)); continue; }
+    const {id, el} = queue.shift();
+    running++;
+    loadOne(id, el).then(() => {
+      running--; doneCount++;
+      setOverlay(doneCount/total, `${doneCount} / ${total}`);
+    });
+  }
+  if (!queue.length){ setOverlay(1, `${doneCount} / ${total}`); }
+}
+
+startBtn.addEventListener('click', async () => {
+  const file = fileInput.files?.[0];
+  if (!file){ alert('Choose your Purchases.xlsx (or CSV) first.'); return; }
+  setStatus('Parsing file…');
+  try {
+    IDS = await parseFile(file);
+    if (!IDS.length){ setStatus('No order IDs found.'); return; }
+    listDiv.innerHTML = '';
+    queue = [];
+    doneCount = 0; cancelled = false; paused = false;
+    total = IDS.length;
+    IDS.forEach((id, i) => {
+      const {wrap} = makeItem(id, i);
+      listDiv.appendChild(wrap);
+      queue.push({id, el: wrap});
+    });
+    setStatus(`Found ${total} orders. Starting sequential load…`);
+    overlay.classList.add('show');
+    setOverlay(0, `0 / ${total}`);
+    runner();
+  } catch (e){
+    console.error(e);
+    setStatus('Error parsing file (see console).');
+  }
+});
+
+pauseBtn.addEventListener('click', () => { paused = true; setStatus('Paused.'); });
+resumeBtn.addEventListener('click', () => { paused = false; setStatus('Resumed.'); });
+cancelBtn.addEventListener('click', () => { cancelled = true; queue = []; setStatus('Cancelled.'); overlay.classList.remove('show'); });
+printBtn.addEventListener('click', () => { window.print(); });
+openTabsBtn.addEventListener('click', () => {
+  if (!IDS.length){ alert('Load a file first.'); return; }
+  const opened = [];
+  IDS.forEach(id => {
+    const url = BASE.replace('{ID}', encodeURIComponent(id));
+    const w = window.open(url, '_blank', 'noopener');
+    if (w) opened.push(url);
+  });
+  setStatus(`Opened ${opened.length} tabs.`);
+});
+</script>
+</body>
+</html>
