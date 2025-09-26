@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Temu Order Links — Simple (Option B)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body{font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;margin:16px}
+  h1{margin:0 0 8px;font-size:20px}
+  .note{font-size:13px;color:#444;margin-bottom:10px}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
+  .btn{padding:10px 14px;border:1px solid #ccc;border-radius:10px;background:#f2f2f7}
+  .count{font-size:13px;color:#333}
+  ol{line-height:1.6;padding-left:18px}
+  li{margin:6px 0}
+  small{color:#666}
+</style>
+</head>
+<body>
+  <h1>Temu Order Links — Simple</h1>
+  <div class="note">
+    Upload <strong>Purchases.xlsx</strong> (or CSV). This page lists one tap-able link per order. 
+    Use <strong>Open Next</strong> to open exactly one order per tap (iOS-friendly).
+  </div>
+  <input id="file" type="file" accept=".xlsx,.xls,.csv" />
+  <div class="bar">
+    <button id="openNext" class="btn">Open Next</button>
+    <button id="copyAll" class="btn">Copy All Links</button>
+    <span id="count" class="count"></span>
+  </div>
+  <ol id="list"></ol>
+
+<script>
+// Load SheetJS
+const XLSX_READY = (function(){
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+  document.head.appendChild(s);
+  return new Promise(r => s.onload = r);
+})();
+
+const BASE = 'https://www.temu.com/bgt_order_detail.html?parent_order_sn={ID}&page_from=1';
+
+const fileEl = document.getElementById('file');
+const listEl = document.getElementById('list');
+const countEl = document.getElementById('count');
+const openNextBtn = document.getElementById('openNext');
+const copyAllBtn = document.getElementById('copyAll');
+
+let LINKS = [];
+let idx = 0;
+
+function setCount(){
+  countEl.textContent = LINKS.length ? `Opened ${idx} of ${LINKS.length}` : '';
+}
+
+function extractParam(url, key){
+  try{ return new URL(url).searchParams.get(key); }catch(e){ return null; }
+}
+function cleanID(v){
+  if (v==null) return null;
+  let s = String(v).trim();
+  if(!s) return null;
+  if (/^https?:\/\//i.test(s)){
+    const id = extractParam(s,'parent_order_sn');
+    if (id) return id.trim();
+  }
+  s = s.replace(/^["']|["']$/g,'').trim();
+  return s;
+}
+
+function buildUrl(id){ return BASE.replace('{ID}', encodeURIComponent(id)); }
+
+function render(ids){
+  listEl.innerHTML = '';
+  LINKS = ids.map(buildUrl);
+  idx = 0;
+  ids.forEach((id,i)=>{
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = buildUrl(id);
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = id;
+    li.appendChild(a);
+    listEl.appendChild(li);
+  });
+  setCount();
+}
+
+async function parseFile(file){
+  const name=(file?.name||'').toLowerCase();
+  const buf=await file.arrayBuffer();
+  await XLSX_READY;
+  const wb = XLSX.read(buf, {type:'array'});
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, {defval:null});
+  const keys = rows.length ? Object.keys(rows[0]) : [];
+  const idKeys = ['Order ID','OrderID','order id','order_id','Order_Id','ORDER ID','ORDER_ID'];
+  const urlKeys = ['url','URL','Url','link','Link'];
+  const orderKey = keys.find(k => idKeys.includes(k));
+  const urlKey = keys.find(k => urlKeys.includes(k));
+  let ids=[];
+  if (orderKey) ids = rows.map(r=>cleanID(r[orderKey])).filter(Boolean);
+  else if (urlKey) ids = rows.map(r=>cleanID(r[urlKey])).filter(Boolean);
+  else ids = rows.flatMap(r => Object.values(r).map(cleanID)).filter(Boolean);
+  // de-dup preserve order
+  const seen=new Set(), uniq=[];
+  for (const id of ids){ if(!seen.has(id)){ seen.add(id); uniq.push(id); } }
+  return uniq;
+}
+
+fileEl.addEventListener('change', async (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const ids = await parseFile(f);
+  render(ids);
+});
+
+openNextBtn.addEventListener('click', ()=>{
+  if (!LINKS.length){ alert('Upload your file first.'); return; }
+  if (idx >= LINKS.length){ setCount(); return; }
+  const url = LINKS[idx++];
+  window.open(url, '_blank'); // user gesture -> allowed
+  setCount();
+});
+
+copyAllBtn.addEventListener('click', async ()=>{
+  if (!LINKS.length) return;
+  const text = LINKS.join('\\n');
+  try{ await navigator.clipboard.writeText(text); countEl.textContent='All links copied.'; }
+  catch(e){ countEl.textContent='Copy failed. Long-press to select and copy.'; }
+});
+</script>
+</body>
+</html>
